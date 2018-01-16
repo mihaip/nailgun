@@ -8,7 +8,8 @@ import shutil
 import uuid
 import sys
 
-from pynailgun import NailgunException, NailgunConnection
+from pynailgun import BytesInputNailgunConnection, NailgunException, \
+    NailgunConnection
 
 
 POSSIBLE_NAILGUN_CODES_ON_NG_STOP = [
@@ -128,6 +129,61 @@ class TestNailgunConnection(unittest.TestCase):
 
         self.ng_server_process.wait()
         self.assertEqual(self.ng_server_process.poll(), 0)
+
+    def test_echo_latency(self):
+        class Times(object):
+            def __init__(self):
+                self.sum = 0
+                self.count = 0
+                self.min = sys.maxint
+                self.max = -sys.maxint - 1
+
+            def add(self, time):
+                self.sum += time
+                self.count += 1
+                if time < self.min:
+                    self.min = time
+                if time > self.max:
+                    self.max = time
+
+            def __str__(self):
+                format = lambda time: '%gms' % round(time * 1000, 1)
+                return '%s (min: %s, max: %s)' % (
+                    format(self.sum / self.count),
+                    format(self.min),
+                    format(self.max))
+
+        TEST_INPUT = 'echo test input'
+
+        def test(connection_class, stdin, times):
+            start_time = time.time()
+            output = StringIO.StringIO()
+            with connection_class(
+                    self.transport_address,
+                    cwd=os.getcwd(),
+                    stderr=None,
+                    stdin=stdin,
+                    stdout=output) as c:
+                c.send_command('ng-echo')
+                times.add(time.time() - start_time)
+                self.assertEqual(TEST_INPUT, output.getvalue().strip())
+
+        nailgun_connection_times = Times()
+        bytes_connection_times = Times()
+
+        for i in range(10):
+            test(
+                connection_class=NailgunConnection,
+                stdin=StringIO.StringIO(TEST_INPUT),
+                times=nailgun_connection_times)
+
+            test(
+                connection_class=BytesInputNailgunConnection,
+                stdin=TEST_INPUT,
+                times=bytes_connection_times)
+
+        print 'NailgunConnection: %s' % nailgun_connection_times
+        print 'BytesInputNailgunConnection: %s' % bytes_connection_times
 
     def tearDown(self):
         if self.ng_server_process.poll() is None:

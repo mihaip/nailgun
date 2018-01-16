@@ -1,1 +1,1 @@
-from ng import NailgunConnection, NailgunException
+from ng import BytesInputNailgunConnection, NailgunConnection, NailgunException

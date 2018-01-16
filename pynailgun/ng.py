@@ -373,34 +373,15 @@ class WindowsNamedPipeTransport(Transport):
         return result
 
 
-class NailgunConnection(object):
-    '''Stateful object holding the connection to the Nailgun server.'''
-
-    def __init__(
-            self,
-            server_name,
-            server_port=None,
-            stdin=sys.stdin,
-            stdout=sys.stdout,
-            stderr=sys.stderr,
-            cwd=None):
+class BaseNailgunConnection(object):
+    def __init__(self, server_name, server_port=None, cwd=None):
         self.transport = make_nailgun_transport(server_name, server_port, cwd)
-        self.stdin = stdin
-        self.stdout = stdout
-        self.stderr = stderr
         self.recv_flags = 0
         self.send_flags = 0
         self.header_buf = ctypes.create_string_buffer(CHUNK_HEADER_LEN)
         self.buf = ctypes.create_string_buffer(BUFSIZE)
-        self.ready_to_send_condition = Condition()
         self.sendtime_nanos = 0
         self.exit_code = None
-        self.stdin_queue = Queue.Queue()
-        self.shutdown_event = Event()
-        self.stdin_thread = Thread(
-            target=stdin_thread_main,
-            args=(self.stdin, self.stdin_queue, self.shutdown_event, self.ready_to_send_condition))
-        self.stdin_thread.daemon = True
 
     def send_command(
             self,
@@ -422,6 +403,15 @@ class NailgunConnection(object):
                 'Server disconnected unexpectedly: {0}'.format(e),
                 NailgunException.CONNECTION_BROKEN)
 
+    def before_send(self):
+        pass
+
+    def after_send(self):
+        pass
+
+    def processed_chunk(self):
+        pass
+
     def _send_command_and_read_response(self, cmd, cmd_args, filearg, env, cwd):
         if filearg:
             send_file_arg(filearg, self)
@@ -429,6 +419,7 @@ class NailgunConnection(object):
             send_chunk(cmd_arg, CHUNKTYPE_ARG, self)
         send_env_var('NAILGUN_FILESEPARATOR', os.sep, self)
         send_env_var('NAILGUN_PATHSEPARATOR', os.pathsep, self)
+        self.before_send()
         send_tty_format(self.stdin, self)
         send_tty_format(self.stdout, self)
         send_tty_format(self.stderr, self)
@@ -436,15 +427,10 @@ class NailgunConnection(object):
             send_env_var(k, v, self)
         send_chunk(cwd, CHUNKTYPE_DIR, self)
         send_chunk(cmd, CHUNKTYPE_CMD, self)
-        self.stdin_thread.start()
         while self.exit_code is None:
             self._process_next_chunk()
-            self._check_stdin_queue()
-        self.shutdown_event.set()
-        with self.ready_to_send_condition:
-            self.ready_to_send_condition.notify()
-        # We can't really join on self.stdin_thread, since
-        # there's no way to interrupt its call to sys.stdin.readline.
+            self.processed_chunk()
+        self.after_send()
         return self.exit_code
 
     def _process_next_chunk(self):
@@ -462,7 +448,57 @@ class NailgunConnection(object):
                 'Server disconnected in select',
                 NailgunException.CONNECTION_BROKEN)
 
-    def _check_stdin_queue(self):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, type, value, traceback):
+        try:
+            self.transport.close()
+        except socket.error:
+            pass
+
+
+class NailgunConnection(BaseNailgunConnection):
+    '''Stateful object holding the connection to the Nailgun server.'''
+
+    def __init__(
+            self,
+            server_name,
+            server_port=None,
+            stdin=sys.stdin,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+            cwd=None):
+        super(NailgunConnection, self).__init__(server_name, server_port, cwd)
+        self.stdin = stdin
+        self.stdout = stdout
+        self.stderr = stderr
+        self.ready_to_send_condition = Condition()
+        self.stdin_queue = Queue.Queue()
+        self.shutdown_event = Event()
+        self.stdin_thread = Thread(
+            target=stdin_thread_main,
+            args=(self.stdin, self.stdin_queue, self.shutdown_event, self.ready_to_send_condition))
+        self.stdin_thread.daemon = True
+
+
+    def before_send(self):
+        send_tty_format(self.stdin, self)
+        self.stdin_thread.start()
+
+    def after_send(self):
+        self.shutdown_event.set()
+        with self.ready_to_send_condition:
+            self.ready_to_send_condition.notify()
+        # We can't really join on self.stdin_thread, since
+        # there's no way to interrupt its call to sys.stdin.readline.
+
+    def send_input(self):
+        with self.ready_to_send_condition:
+            # Wake up the stdin thread and tell it to read as much data as possible.
+            self.ready_to_send_condition.notify()
+
+    def processed_chunk(self):
         '''Check if the stdin thread has read anything.'''
         while not self.stdin_queue.empty():
             try:
@@ -476,15 +512,31 @@ class NailgunConnection(object):
             except Queue.Empty:
                 break
 
-    def __enter__(self):
-        return self
+class BytesInputNailgunConnection(BaseNailgunConnection):
+    '''Variant of NailgunConnection when stdin is directly available as a
+    bytes object. Removes the need for a separate read to read stdin and reduces
+    latency.'''
 
-    def __exit__(self, type, value, traceback):
-        try:
-            self.transport.close()
-        except socket.error:
-            pass
+    def __init__(
+            self,
+            server_name,
+            server_port=None,
+            stdin=None,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+            cwd=None):
+        super(BytesInputNailgunConnection, self).__init__(
+            server_name, server_port, cwd)
+        self.stdin = stdin
+        self.stdout = stdout
+        self.stderr = stderr
 
+    def send_input(self):
+        if self.stdin is not None:
+            send_chunk(self.stdin, CHUNKTYPE_STDIN, self)
+            self.stdin = None
+        else:
+            send_chunk('', CHUNKTYPE_STDIN_EOF, self)
 
 def monotonic_time_nanos():
     '''Returns a monotonically-increasing timestamp value in nanoseconds.
@@ -715,9 +767,7 @@ def process_nailgun_stream(nailgun_connection):
     elif chunk_type == CHUNKTYPE_EXIT:
         process_exit(chunk_len, nailgun_connection)
     elif chunk_type == CHUNKTYPE_SENDINPUT:
-        with nailgun_connection.ready_to_send_condition:
-            # Wake up the stdin thread and tell it to read as much data as possible.
-            nailgun_connection.ready_to_send_condition.notify()
+        nailgun_connection.send_input()
     else:
         raise NailgunException(
             'Unexpected chunk type: {0}'.format(chunk_type),
